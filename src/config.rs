@@ -8,6 +8,7 @@ use toml;
 #[derive(Deserialize)]
 pub struct Config {
     pub slack_token: String,
+    pub user_name: String,
 }
 
 pub fn read() -> Result<Config, String>{
