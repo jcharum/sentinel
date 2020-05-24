@@ -1,6 +1,10 @@
 use reqwest;
 use sentinel::config;
 use slack_api;
+use std::io;
+use std::io::Read;
+use std::io::Write;
+use std::thread;
 
 type SResult<T> = Result<T, String>;
 
@@ -11,8 +15,36 @@ fn main() -> SResult<()> {
         .map_err(|err| format!("could not get Slack API client: {}", err))?;
     let members = fetch_members(&client, &token)?;
     let user_id = find_user_id(&members, &config.user_name)?;
-    send_message(&client, &token, &user_id, "Hello, world!")?;
+    wait_exit()?;
+    send_message(&client, &token, &user_id, "done")?;
     Ok(())
+}
+
+fn wait_exit() -> SResult<()> {
+    let thread = thread::spawn(move || {
+        let _ = pass_stdin();
+    });
+    thread
+        .join()
+        .map_err(|err| format!("stdin passthrough join failed: {:?}", err))?;
+    Ok(())
+}
+
+fn pass_stdin() -> SResult<()> {
+    let mut stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut buffer = [0; 1 << 20];
+    loop {
+        let n = stdin
+            .read(&mut buffer)
+            .map_err(|err| format!("stdin read error: {}", err))?;
+        stdout
+            .write(&buffer[..n])
+            .map_err(|err| format!("stdout write error: {}", err))?;
+        if n == 0 {
+            return Ok(());
+        }
+    }
 }
 
 fn send_message(client: &reqwest::Client, token: &str, user_id: &str, text: &str) -> SResult<()> {
