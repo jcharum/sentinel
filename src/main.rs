@@ -16,7 +16,7 @@ struct Messenger<'a> {
 }
 
 impl<'a> Messenger<'a> {
-    fn send(self: &Messenger<'a>, text: &str) -> SResult<()> {
+    fn send(&self, text: &str) -> SResult<()> {
         let text = format!("`{}`: {}", process::id(), text);
         send_message(self.client, self.token, self.user_id, &text)?;
         Ok(())
