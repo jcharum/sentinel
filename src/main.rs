@@ -4,9 +4,24 @@ use slack_api;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::process;
 use std::thread;
 
 type SResult<T> = Result<T, String>;
+
+struct Messenger<'a> {
+    client: &'a reqwest::Client,
+    token: &'a str,
+    user_id: &'a str,
+}
+
+impl<'a> Messenger<'a> {
+    fn send(self: &Messenger<'a>, text: &str) -> SResult<()> {
+        let text = format!("`{}`: {}", process::id(), text);
+        send_message(self.client, self.token, self.user_id, &text)?;
+        Ok(())
+    }
+}
 
 fn main() -> SResult<()> {
     let config = config::read()?;
@@ -15,8 +30,14 @@ fn main() -> SResult<()> {
         .map_err(|err| format!("could not get Slack API client: {}", err))?;
     let members = fetch_members(&client, &token)?;
     let user_id = find_user_id(&members, &config.user_name)?;
+    let m = Messenger {
+        client: &client,
+        token: &token,
+        user_id: &user_id,
+    };
+    m.send("Reporting for duty!")?;
     wait_exit()?;
-    send_message(&client, &token, &user_id, "done")?;
+    m.send("Process exited.")?;
     Ok(())
 }
 
