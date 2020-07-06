@@ -1,27 +1,21 @@
+use crossbeam::thread::scope;
+use crossbeam_channel::bounded;
+use crossbeam_channel::select;
+use crossbeam_channel::tick;
+use humantime::format_duration;
 use reqwest;
 use sentinel::config;
+use sentinel::ring::RingBuf;
+use sentinel::messenger::Messenger;
+use sentinel::result::SResult;
 use slack_api;
 use std::io;
+use std::io::prelude::BufRead;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
-use std::process;
-use std::thread;
-
-type SResult<T> = Result<T, String>;
-
-struct Messenger<'a> {
-    client: &'a reqwest::Client,
-    token: &'a str,
-    user_id: &'a str,
-}
-
-impl<'a> Messenger<'a> {
-    fn send(&self, text: &str) -> SResult<()> {
-        let text = format!("`{}`: {}", process::id(), text);
-        send_message(self.client, self.token, self.user_id, &text)?;
-        Ok(())
-    }
-}
+use std::time::Duration;
+use std::time::Instant;
 
 fn main() -> SResult<()> {
     let config = config::read()?;
@@ -30,50 +24,96 @@ fn main() -> SResult<()> {
         .map_err(|err| format!("could not get Slack API client: {}", err))?;
     let members = fetch_members(&client, &token)?;
     let user_id = find_user_id(&members, &config.user_name)?;
-    let m = Messenger {
-        client: &client,
-        token: &token,
-        user_id: &user_id,
-    };
-    m.send("Reporting for duty!")?;
-    wait_exit()?;
-    m.send("Process exited.")?;
-    Ok(())
-}
-
-fn wait_exit() -> SResult<()> {
-    let thread = thread::spawn(move || {
-        let _ = pass_stdin();
+    let messenger = Messenger::new(client, token, user_id)?;
+    let mut buf = RingBuf::new(10);
+    let start = Instant::now();
+    messenger.send("Started")?;
+    process_stdin(&start, &messenger, &mut buf)?;
+    let mut s = String::new();
+    s.push_str("Exited");
+    push_output(&mut s, &buf.contents());
+    messenger.send(&s).unwrap_or_else(|err| {
+        eprintln!("error sending message to Slack: {}", err);
     });
-    thread
-        .join()
-        .map_err(|err| format!("stdin passthrough join failed: {:?}", err))?;
+    buf.clear();
     Ok(())
 }
 
-fn pass_stdin() -> SResult<()> {
-    let mut stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut buffer = [0; 1 << 20];
-    loop {
-        let n = stdin
-            .read(&mut buffer)
-            .map_err(|err| format!("stdin read error: {}", err))?;
-        stdout
-            .write(&buffer[..n])
-            .map_err(|err| format!("stdout write error: {}", err))?;
-        if n == 0 {
-            return Ok(());
-        }
+fn process_stdin(start: &Instant, messenger: &Messenger, buf: &mut RingBuf) -> SResult<()> {
+    let (pipe_r, mut pipe_w) = pipe::pipe();
+    let reader = BufReader::new(pipe_r);
+    scope(|s| {
+        let (line_s, line_r) = bounded(0);
+        s.spawn(move |_| {
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        // Receiver should never disconnect before we've sent
+                        // all lines.
+                        line_s.send(line).unwrap()
+                    }
+                    Err(e) => eprintln!("error reading lines from stdin: {}", e),
+                }
+            }
+        });
+        s.spawn(move |_| {
+            let ticker = tick(Duration::from_secs(10));
+            loop {
+                select! {
+                    recv(line_r) -> msg =>
+                        match msg {
+                            Ok(line) => buf.push(&line),
+                            Err(_) => break,
+                        },
+                    recv(ticker) -> _ => {
+                        let mut s = String::new();
+                        let ts = Duration::from_secs(start.elapsed().as_secs());
+                        s.push_str(&format_duration(ts).to_string());
+                        s.push_str(" elapsed");
+                        push_output(&mut s, &buf.contents());
+                        messenger.send(&s).unwrap_or_else(|err| {
+                            eprintln!("error sending message to Slack: {}", err);
+                        });
+                        buf.clear();
+                    }
+                }
+            }
+        });
+        tee(&mut io::stdin(), &mut io::stdout(), &mut pipe_w).unwrap_or_else(|err| {
+            eprintln!("error teeing input: {}", err);
+        });
+        drop(pipe_w);
+    })
+    .map_err(|_err| format!("TODO"))?;
+    Ok(())
+}
+
+fn push_output(s: &mut String, output: &str) {
+    if output.is_empty() {
+        s.push_str("; no new output")
+    } else {
+        s.push_str("\n```\n");
+        s.push_str(output);
+        s.push_str("```\n");
     }
 }
 
-fn send_message(client: &reqwest::Client, token: &str, user_id: &str, text: &str) -> SResult<()> {
-    let mut req = slack_api::chat::PostMessageRequest::default();
-    req.channel = user_id;
-    req.text = text;
-    let _resp = slack_api::chat::post_message(client, token, &req)
-        .map_err(|err| format!("could not post message: {}", err));
+fn tee(input: &mut dyn Read, output_0: &mut dyn Write, output_1: &mut dyn Write) -> SResult<()> {
+    let mut buffer = [0; 1 << 20];
+    loop {
+        let n = input
+            .read(&mut buffer)
+            .map_err(|err| format!("stdin read error: {}", err))?;
+        output_0
+            .write(&buffer[..n])
+            .map_err(|err| format!("stdout write error: {}", err))?;
+        output_1
+            .write(&buffer[..n])
+            .map_err(|err| format!("pipe write error: {}", err))?;
+        if n == 0 {
+            break;
+        }
+    }
     Ok(())
 }
 
